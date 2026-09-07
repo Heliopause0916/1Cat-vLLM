@@ -320,3 +320,21 @@ def test_lora_target_modules_default_none(serve_parser):
     """Test that lora-target-modules defaults to None"""
     args = serve_parser.parse_args(args=[])
     assert args.lora_target_modules is None
+
+
+def test_enable_per_request_metrics_default_false(serve_parser):
+    """Ensure --enable-per-request-metrics defaults to False and parses"""
+    args = serve_parser.parse_args(args=[])
+    assert args.enable_per_request_metrics is False
+    args = serve_parser.parse_args(args=["--enable-per-request-metrics"])
+    assert args.enable_per_request_metrics is True
+
+
+def test_per_request_metrics_mutually_exclusive_with_disable_log_stats(serve_parser):
+    """Ensure validation fails if per-request metrics and disable-log-stats
+    are both set"""
+    args = serve_parser.parse_args(
+        args=["--enable-per-request-metrics", "--disable-log-stats"]
+    )
+    with pytest.raises(TypeError):
+        validate_parsed_serve_args(args)
