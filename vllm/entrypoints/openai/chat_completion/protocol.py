@@ -26,6 +26,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionDefinition,
     LegacyStructuralTagResponseFormat,
     OpenAIBaseModel,
+    PerRequestTimingMetrics,
     StreamOptions,
     StructuralTagResponseFormat,
     ToolCall,
@@ -124,6 +125,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    metrics: PerRequestTimingMetrics | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -146,6 +148,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
+    metrics: PerRequestTimingMetrics | None = Field(default=None)
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: list[int] | None = None
     # Rendered prompt text from chat templating (only set when
