@@ -649,6 +649,7 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        last_res: RequestOutput | None = None
         try:
             async for res in result_generator:
                 last_res = res
@@ -1110,11 +1111,11 @@ class OpenAIServingChat(OpenAIServing):
                     )
 
                 metrics: PerRequestTimingMetrics | None = None
+                last_metrics = last_res.metrics if last_res is not None else None
                 if self.enable_per_request_metrics and request.n in (None, 1):
-                    if last_res.metrics is not None:
-                        metrics = build_per_request_timing_metrics(
-                            last_res.metrics, num_generation_tokens=completion_tokens
-                        )
+                    metrics = build_per_request_timing_metrics(
+                        last_metrics, num_generation_tokens=completion_tokens
+                    )
 
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,

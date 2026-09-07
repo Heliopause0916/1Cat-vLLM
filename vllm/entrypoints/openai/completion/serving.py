@@ -305,6 +305,7 @@ class OpenAIServingCompletion(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        last_res: RequestOutput | None = None
         try:
             async for prompt_idx, res in result_generator:
                 last_res = res
@@ -455,14 +456,14 @@ class OpenAIServingCompletion(OpenAIServing):
 
             if include_usage:
                 metrics: PerRequestTimingMetrics | None = None
+                last_metrics = last_res.metrics if last_res is not None else None
                 if (
                     self.enable_per_request_metrics
                     and request.n == 1
                     and num_prompts == 1
-                    and last_res.metrics is not None
                 ):
                     metrics = build_per_request_timing_metrics(
-                        last_res.metrics, num_generation_tokens=total_completion_tokens
+                        last_metrics, num_generation_tokens=total_completion_tokens
                     )
 
                 final_usage_chunk = CompletionStreamResponse(
