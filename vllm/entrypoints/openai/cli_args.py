@@ -140,6 +140,11 @@ class BaseFrontendArgs:
     """If set to True, enable tracking server_load_metrics in the app state."""
     enable_force_include_usage: bool = False
     """If set to True, including usage on every request."""
+    enable_per_request_metrics: bool = False
+    """If specified, the server will report per-request metrics (e.g. TTFT,
+    inter-token latency, tokens/s) in the response. This flag is mutually
+    exclusive with --disable-log-stats, since per-request metrics depend on
+    the request-level stats that log stats collection provides."""
     enable_tokenizer_info_endpoint: bool = False
     """Enable the `/tokenizer_info` endpoint. May expose chat
     templates and other tokenizer configuration."""
@@ -399,6 +404,11 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
+    if args.enable_per_request_metrics and args.disable_log_stats:
+        raise TypeError(
+            "Error: --enable-per-request-metrics cannot be used with "
+            "--disable-log-stats"
+        )
 
     if args.data_parallel_multi_port_external_lb:
         from vllm.entrypoints.openai.dp_supervisor import (
