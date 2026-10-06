@@ -528,6 +528,7 @@ _warned_decode_strict_fallback = False
 _warned_prefill_gather_oom = False
 _warned_prefill_dense_splitkv3_oom = False
 _warned_prefill_d256_gqa_architecture_oom = False
+_warned_prefill_d256_gqa_architecture_guard = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
@@ -1693,7 +1694,21 @@ def _run_sm70_gqa_groups(
 ) -> torch.Tensor:
     """Apply the native GQA6 core independently to each local KV head."""
     if query.shape[0] == 1 and key.shape[2] == 1:
-        return op(query, key, value, out, softmax_scale, causal)
+        # The native kernel contract requires contiguous q, k, v, and out;
+        # the fringe dispatcher feeds the core as non-contiguous slices, so
+        # materialize copies only when a caller does.
+        if not query.is_contiguous():
+            query = query.contiguous()
+        if not key.is_contiguous():
+            key = key.contiguous()
+        if not value.is_contiguous():
+            value = value.contiguous()
+        if out.is_contiguous():
+            return op(query, key, value, out, softmax_scale, causal)
+        core_out = out.contiguous()
+        op(query, key, value, core_out, softmax_scale, causal)
+        out.copy_(core_out)
+        return out
     for batch in range(query.shape[0]):
         for head in range(key.shape[2]):
             group_q = query[batch : batch + 1, :, head * 6 : (head + 1) * 6]
@@ -1878,6 +1893,7 @@ def _try_sm70_fa2_d256_prefill(
 ) -> torch.Tensor | None:
     global _logged_prefill_d256_gqa_architecture
     global _warned_prefill_d256_gqa_architecture_oom
+    global _warned_prefill_d256_gqa_architecture_guard
 
     int32_max = torch.iinfo(torch.int32).max
     if not envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
@@ -2013,6 +2029,7 @@ def _try_sm70_fa2_d256_prefill(
                     if architecture_op is not None
                     and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
                     and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
+                    and max_seqlen_k >= _SM70_79T_MAX_QUERY_LEN
                     else None
                 )
                 if _should_use_prefill_d256_gqa_architecture(
@@ -2066,6 +2083,23 @@ def _try_sm70_fa2_d256_prefill(
                                 "falling back to the exact dense kernel."
                             )
                             _warned_prefill_d256_gqa_architecture_oom = True
+                    except RuntimeError as exc:
+                        # Anchored to the shared kernel-contract text in
+                        # csrc/attention/sm70_79t/prefill.cu for the Q8000/
+                        # Q8192 instantiations (~L6718).  The half2 variant's
+                        # "SM70 half2 architecture requires KV" guard is not
+                        # matched (same range today, so unreachable; keep in
+                        # sync if kernel wording changes).
+                        if "SM70 GQA architecture requires KV" not in str(exc):
+                            raise
+                        if not _warned_prefill_d256_gqa_architecture_guard:
+                            logger.warning(
+                                "SM70 D256 GQA long-prefill architecture "
+                                "rejected this shape at its kernel guard "
+                                "(%s); falling back to the generic path.",
+                                exc,
+                            )
+                            _warned_prefill_d256_gqa_architecture_guard = True
                     if splitd_result is not None:
                         if not _logged_prefill_d256_gqa_architecture:
                             logger.info(

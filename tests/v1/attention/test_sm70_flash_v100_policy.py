@@ -1338,6 +1338,275 @@ def test_sm70_79t_q8192_dispatch_leading_pads_mixed_chunks(query_len):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("query_len", "kv_len"),
+    [
+        # First chunked-prefill chunk of an 8192-token budget with decoding
+        # rows occupying 32 tokens: q=kv=8160, aligned, no prefix cache.
+        pytest.param(8160, 8160, id="chunk8160-kv-below-q8192-guard"),
+        pytest.param(8192, 8192, id="kv-meets-q8192-guard-boundary"),
+        pytest.param(8160, 8192, id="padded-query-meets-q8192-guard"),
+        pytest.param(8000, 8160, id="q8000-core-aligned-kv"),
+    ],
+)
+def test_prefill_d256_gqa_architecture_routes_below_q8192_kv_guard_to_fringe(
+    monkeypatch,
+    query_len,
+    kv_len,
+):
+    import vllm.envs as envs
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70/V100 is required")
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    monkeypatch.setattr(flash_v100, "_is_cuda_graph_capturing", lambda _: False)
+    monkeypatch.setattr(flash_v100, "_sm70_79t_q8192_padding_workspaces", {})
+    monkeypatch.setattr(
+        flash_v100,
+        "_logged_prefill_d256_gqa_architecture",
+        False,
+    )
+
+    q8192_calls = []
+    core_calls = []
+    dense_calls = []
+
+    def q8192_op(query, key, value, out, softmax_scale, causal):
+        q8192_calls.append((query.shape, key.shape))
+        out.fill_(11)
+        return out
+
+    def core_op(query, key, value, out, softmax_scale, causal):
+        core_calls.append((query.shape, key.shape))
+        out.fill_(7)
+        return out
+
+    def dense_op(query, key, value, out, softmax_scale, causal):
+        dense_calls.append((query.shape, key.shape))
+        out.fill_(3)
+        return out
+
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_sm70_splitd_d256_ops",
+        lambda: (dense_op, object(), None),
+    )
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_sm70_d256_gqa_architecture_op",
+        lambda: core_op,
+    )
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_sm70_d256_gqa_architecture_q8192_op",
+        lambda: q8192_op,
+    )
+    routes: list[str] = []
+    monkeypatch.setattr(flash_v100, "_record_route", routes.append)
+
+    query = torch.zeros((1, query_len, 6, 256), dtype=torch.float16, device="cuda")
+    key = torch.zeros((1, kv_len, 1, 256), dtype=torch.float16, device="cuda")
+    value = torch.zeros_like(key)
+    out = torch.zeros_like(query)
+
+    result = flash_v100._try_sm70_fa2_d256_prefill(
+        query,
+        key,
+        value,
+        cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device="cuda"),
+        cu_seqlens_k=torch.tensor([0, kv_len], dtype=torch.int32, device="cuda"),
+        max_seqlen_q=query_len,
+        max_seqlen_k=kv_len,
+        softmax_scale=0.0625,
+        causal=True,
+        window_size=(-1, -1),
+        out=out,
+    )
+
+    assert result is out
+    if kv_len < 8192:
+        # The Q8192 kernel contract only accepts KV >= 8192, so below that
+        # bound the dispatcher must keep the Q8000 core with an exact leading
+        # dense fringe rather than padding the query.
+        assert q8192_calls == []
+        assert core_calls == [
+            (
+                torch.Size([1, 8000, 6, 256]),
+                torch.Size([1, kv_len, 1, 256]),
+            )
+        ]
+        fringe_len = query_len - 8000
+        if fringe_len:
+            padded_fringe_len = ((fringe_len + 63) // 64) * 64
+            assert dense_calls == [
+                (
+                    torch.Size([1, padded_fringe_len, 6, 256]),
+                    torch.Size([1, kv_len - 8000, 1, 256]),
+                )
+            ]
+            assert torch.all(out[:, :fringe_len] == 3)
+            assert torch.all(out[:, fringe_len:] == 7)
+        else:
+            assert dense_calls == []
+            assert torch.all(out == 7)
+        expected_routes = [
+            "prefill_dense_d256_gqa_arch_long",
+            "prefill_dense_d256_gqa_79t_fp32",
+        ]
+        if query_len > 8000:
+            expected_routes.append("prefill_dense_d256_gqa_79t_fp32_fringe_fallback")
+    else:
+        assert q8192_calls == [
+            (
+                torch.Size([1, 8192, 6, 256]),
+                torch.Size([1, 8192, 1, 256]),
+            )
+        ]
+        assert core_calls == []
+        assert dense_calls == []
+        assert torch.all(out == 11)
+        expected_routes = [
+            "prefill_dense_d256_gqa_arch_long",
+            "prefill_dense_d256_gqa_79t_fp32",
+            "prefill_dense_d256_gqa_79t_fp32_q8192",
+        ]
+        if query_len < 8192:
+            expected_routes.append("prefill_dense_d256_gqa_79t_fp32_q8192_pad")
+    assert routes == expected_routes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("guard_error", "expected_fallback"),
+    [
+        pytest.param(
+            RuntimeError(
+                "SM70 GQA architecture requires KV in [8192, 262144] with "
+                "32-token alignment, got 8096"
+            ),
+            True,
+            id="kernel-contract-guard-falls-back",
+        ),
+        pytest.param(
+            RuntimeError("unrelated kernel failure"),
+            False,
+            id="unrelated-runtime-error-propagates",
+        ),
+    ],
+)
+def test_prefill_d256_gqa_architecture_guard_runtime_error_falls_back(
+    monkeypatch,
+    guard_error,
+    expected_fallback,
+):
+    import vllm.envs as envs
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70/V100 is required")
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    monkeypatch.setattr(flash_v100, "_is_cuda_graph_capturing", lambda _: False)
+    monkeypatch.setattr(
+        flash_v100,
+        "_warned_prefill_d256_gqa_architecture_guard",
+        False,
+    )
+
+    calls = []
+
+    def dense_op(query, key, value, out, softmax_scale, causal):
+        calls.append(("dense", tuple(query.shape), tuple(key.shape)))
+        out.fill_(3)
+        return out
+
+    def q8192_op(query, key, value, out, softmax_scale, causal):
+        calls.append(("q8192", tuple(query.shape), tuple(key.shape)))
+        raise guard_error
+
+    monkeypatch.setattr(
+        flash_v100, "_get_sm70_splitd_d256_ops", lambda: (dense_op, object(), None)
+    )
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_sm70_d256_gqa_architecture_op",
+        lambda *a, **k: pytest.fail(
+            "core op must not run when the Q8192 op is selected"
+        ),
+    )
+    monkeypatch.setattr(
+        flash_v100,
+        "_get_sm70_d256_gqa_architecture_q8192_op",
+        lambda: q8192_op,
+    )
+    routes: list[str] = []
+    monkeypatch.setattr(flash_v100, "_record_route", routes.append)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        flash_v100.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+
+    query_len = kv_len = 8192
+    query = torch.zeros((1, query_len, 6, 256), dtype=torch.float16, device="cuda")
+    key = torch.zeros((1, kv_len, 1, 256), dtype=torch.float16, device="cuda")
+    value = torch.zeros_like(key)
+    out = torch.zeros_like(query)
+    args = (query, key, value)
+    cu_seqlens_q = torch.tensor([0, query_len], dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.tensor([0, kv_len], dtype=torch.int32, device="cuda")
+
+    if expected_fallback:
+        # The C++ kernel contract guard must be absorbed: the request stays
+        # alive and lands on the exact dense kernel instead of killing the
+        # whole worker.
+        result = flash_v100._try_sm70_fa2_d256_prefill(
+            *args,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=query_len,
+            max_seqlen_k=kv_len,
+            softmax_scale=0.0625,
+            causal=True,
+            window_size=(-1, -1),
+            out=out,
+        )
+        assert result is out
+        assert calls == [
+            ("q8192", (1, 8192, 6, 256)),
+            ("dense", (1, 8192, 6, 256), (1, 8192, 1, 256)),
+        ]
+        assert torch.all(out == 3)
+        assert len(warnings) == 1
+        assert "SM70 GQA architecture requires KV" in warnings[0]
+        assert flash_v100._warned_prefill_d256_gqa_architecture_guard is True
+    else:
+        with pytest.raises(RuntimeError, match="unrelated kernel failure"):
+            flash_v100._try_sm70_fa2_d256_prefill(
+                *args,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=query_len,
+                max_seqlen_k=kv_len,
+                softmax_scale=0.0625,
+                causal=True,
+                window_size=(-1, -1),
+                out=out,
+            )
+        assert warnings == []
+        assert flash_v100._warned_prefill_d256_gqa_architecture_guard is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prefill_d256_gqa_architecture_oom_uses_dense_fallback(monkeypatch):
     import vllm.envs as envs
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
@@ -3733,6 +4002,49 @@ def test_gqa_group_dispatch_preserves_head_and_batch_mapping(kv_heads):
     )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     assert len(calls) == 2 * kv_heads
+
+
+def test_gqa_group_dispatch_fast_path_feeds_native_op_contiguous_tensors():
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    # Fringe dispatch of an 8160-token chunk: the Q8000 core is a
+    # non-contiguous slice of the 8160-row query and output buffers.  With
+    # one KV head per rank this reaches the fast path, where the native
+    # kernel contract requires all four tensors to be contiguous.
+    query = torch.zeros((1, 8160, 6, 4), dtype=torch.float32)
+    key = torch.arange(8160, dtype=torch.float32).reshape(1, 8160, 1, 4)
+    value = key + 3
+    out = torch.zeros_like(query)
+
+    core_query = query[:, 160:]
+    core_out = out[:, 160:]
+    assert not core_query.is_contiguous()
+    assert not core_out.is_contiguous()
+
+    seen = []
+
+    def operator(query, key, value, output, scale, causal):
+        seen.append(
+            (
+                query.is_contiguous(),
+                key.is_contiguous(),
+                value.is_contiguous(),
+                output.is_contiguous(),
+            )
+        )
+        output.copy_(
+            query + key[:, :8000].expand_as(query) + value[:, :8000].expand_as(query)
+        )
+        return output
+
+    result = mod._run_sm70_gqa_groups(
+        operator, core_query, key, value, core_out, 0.0625, True
+    )
+
+    assert result is core_out
+    assert seen == [(True, True, True, True)]
+    expected_core = core_query + key[:, :8000] + value[:, :8000]
+    torch.testing.assert_close(out[:, 160:], expected_core, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
