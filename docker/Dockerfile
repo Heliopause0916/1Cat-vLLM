@@ -343,6 +343,7 @@ WORKDIR /workspace
 
 COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY scripts/serve_qwen38_27b_nvfp4_v100.sh scripts/
+COPY scripts/serve_flash_next_nvfp4_v100.sh scripts/
 COPY cmake cmake/
 COPY csrc csrc/
 COPY flash_qla flash_qla/
@@ -350,6 +351,7 @@ COPY flashinfer-sm70 flashinfer-sm70/
 COPY flash-attention-v100 flash-attention-v100/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
+COPY vllm/envs_metadata.py vllm/envs_metadata.py
 
 # max jobs used by Ninja to build extensions
 ARG max_jobs=2
