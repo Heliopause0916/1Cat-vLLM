@@ -18,7 +18,8 @@ vllm/vllm-rs
 /.pytest_cache
 /.ruff_cache
 /.serena
-/.gemini
+/.gemini/*
+!/.gemini/config.yaml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
