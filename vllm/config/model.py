@@ -93,7 +93,9 @@ def is_cumem_allocator_available() -> bool:
 RunnerOption = Literal["auto", RunnerType]
 ConvertType = Literal["none", "embed", "classify"]
 ConvertOption = Literal["auto", ConvertType]
-TokenizerMode = Literal["auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4"]
+TokenizerMode = Literal[
+    "auto", "hf", "slow", "mistral", "deepseek_v32", "deepseek_v4", "deepseek_v41"
+]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 LogprobsMode = Literal[
     "raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"
@@ -145,6 +147,7 @@ class ModelConfig:
     - "mistral" will always use the tokenizer from `mistral_common`.
     - "deepseek_v32" will always use the tokenizer from `deepseek_v32`.
     - "deepseek_v4" will always use the tokenizer from `deepseek_v4`.
+    - "deepseek_v41" uses the independent V4.1 text and tool encoding.
     - "qwen_vl" will always use the tokenizer from `qwen_vl`.
     - Other custom values can be supported via plugins.
 
@@ -359,6 +362,7 @@ class ModelConfig:
     mm_shm_cache_max_object_size_mb: InitVar[int | None] = None
     mm_encoder_only: InitVar[bool | None] = None
     mm_encoder_tp_mode: InitVar[MMEncoderTPMode | None] = None
+    mm_encoder_batch_size: InitVar[int | None] = None
     mm_encoder_attn_backend: InitVar[AttentionBackendEnum | str | None] = None
     mm_encoder_attn_dtype: InitVar[str | None] = None
     mm_encoder_fp8_scale_path: InitVar[str | None] = None
@@ -412,6 +416,7 @@ class ModelConfig:
             "mm_processor_cache_type",
             "mm_shm_cache_max_object_size_mb",
             "mm_encoder_tp_mode",
+            "mm_encoder_batch_size",
             "interleave_mm_strings",
             "skip_mm_profiling",
         }
@@ -485,6 +490,7 @@ class ModelConfig:
         mm_shm_cache_max_object_size_mb: int | None,
         mm_encoder_only: bool | None,
         mm_encoder_tp_mode: MMEncoderTPMode | None,
+        mm_encoder_batch_size: int | None,
         mm_encoder_attn_backend: AttentionBackendEnum | str | None,
         mm_encoder_attn_dtype: str | None,
         mm_encoder_fp8_scale_path: str | None,
@@ -630,6 +636,8 @@ class ModelConfig:
                 self.tokenizer_mode = "deepseek_v32"
             elif arch == "DeepseekV4ForCausalLM":
                 self.tokenizer_mode = "deepseek_v4"
+            elif arch == "DeepseekV41ForCausalLM":
+                self.tokenizer_mode = "deepseek_v41"
 
             if self.tokenizer_mode != "auto":
                 logger.info(
@@ -704,6 +712,7 @@ class ModelConfig:
                 mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
                 mm_encoder_only=mm_encoder_only,
                 mm_encoder_tp_mode=mm_encoder_tp_mode,
+                mm_encoder_batch_size=mm_encoder_batch_size,
                 mm_encoder_attn_backend=mm_encoder_attn_backend,
                 mm_encoder_attn_dtype=mm_encoder_attn_dtype,
                 mm_encoder_fp8_scale_path=mm_encoder_fp8_scale_path,
